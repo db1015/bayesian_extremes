@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environments
+venv/
+.env/
+my_env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+
+# Large data
+data/
+figures/
+outputs/
+
+# NetCDF
+*.nc
+
+# NumPy
+*.npy
+*.npz
+
+# Misc
+*.tmp

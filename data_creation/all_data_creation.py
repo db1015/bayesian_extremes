@@ -1,0 +1,337 @@
+
+# coding: utf-8
+
+#!/usr/bin/env python3
+
+import os
+import glob
+import sys
+import numpy as np
+import xarray as xr
+
+
+# --------------------------------------------------
+# USER SETTINGS
+# --------------------------------------------------
+NETID = os.environ.get("NETID", "k16v981")
+
+IN_GLOB = f"/home/group/cascadetuholske/data/raw/climate/ERA5/WetBulbTempInputData/WetBulbTempInput-*.nc"
+OUT_DIR = f"/home/{NETID}/my_work/code/arabian_peninsula/bayesian_extremes/data/DailyPeakState"
+
+# AP bounding box
+LAT_MAX = 34
+LAT_MIN = 10
+LON_MIN = 34
+LON_MAX = 60
+
+# Chunking
+CHUNKS = {"time": 24, "latitude": 80, "longitude": 80}
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# --------------------------------------------------
+# IMPORT YOUR LOCAL FORMULAS
+# --------------------------------------------------
+# Update these paths/modules to match your setup
+sys.path.append(f"/home/{NETID}/my_work/code/arabian_peninsula/")
+sys.path.append(f"/home/{NETID}/my_work/code/arabian_peninsula/bayesian_extremes/")
+
+from stickiness import stickiness_equation
+from atmos import thermo
+
+# --------------------------------------------------
+# HELPER FUNCTIONS
+# --------------------------------------------------
+def vapor_pressure_from_dewpoint(td_c):
+    """
+    Vapor pressure from dewpoint temperature.
+    Input: td_c in deg C
+    Output: vapor pressure in hPa
+    """
+    return 6.112 * np.exp((17.67 * td_c) / (td_c + 243.5))
+
+def specific_humidity_from_td_sp(td_c, sp_pa):
+    """
+    Specific humidity from dewpoint and surface pressure.
+    td_c : dewpoint in deg C
+    sp_pa: surface pressure in Pa
+    returns q in kg/kg
+    """e 
+    e_hpa = vapor_pressure_from_dewpoint(td_c)
+    p_hpa = sp_pa / 100.0
+    q = 0.622 * e_hpa / (p_hpa - 0.378 * e_hpa)
+    return q
+
+def rh_from_t_td(t_c, td_c):
+    """
+    Relative humidity from temperature and dewpoint.
+    Input: t_c, td_c in deg C
+    Output: RH in %
+    """
+    rh = 100.0 * np.exp(
+        (17.625 * td_c) / (243.04 + td_c)
+        - (17.625 * t_c) / (243.04 + t_c)
+    )
+    return rh
+
+
+
+# --------------------------------------------------
+# CORE UTILITIES
+# --------------------------------------------------
+def add_day_hour_coords(da):
+    day = xr.DataArray(
+        da.time.dt.floor("D").values,
+        coords={"time": da.time},
+        dims="time",
+        name="day"
+    )
+    hour = xr.DataArray(
+        da.time.dt.hour.values,
+        coords={"time": da.time},
+        dims="time",
+        name="hour"
+    )
+    return da.assign_coords(day=day, hour=hour)
+
+def to_day_hour(da):
+    """
+    Convert (time, lat, lon) -> (day, hour, lat, lon)
+    Assumes hourly regular data.
+    """
+    da = add_day_hour_coords(da)
+    return da.set_index(time=["day", "hour"]).unstack("time").transpose(
+        "day", "hour", "latitude", "longitude"
+    )
+
+def daily_peak_and_hour(da_dayhour, name):
+    valid = da_dayhour.notnull().any("hour")
+    filled = da_dayhour.fillna(-np.inf)
+
+    imax = filled.argmax("hour").load()
+    peak = (
+        da_dayhour
+        .max("hour", skipna=True)
+        .reset_coords(drop=True)
+        .rename(f"{name}_daily_peak")
+    )
+    hour_of_peak = (
+        da_dayhour["hour"]
+        .isel(hour=imax)
+        .where(valid)
+        .reset_coords(drop=True)
+        .rename(f"{name}_hour_of_daily_peak")
+    )
+    return peak, hour_of_peak, imax
+
+def value_at_given_hour(da_dayhour, hour_indexer, out_name):
+    """
+    Extract value from da_dayhour(day, hour, lat, lon) using a 3D hour indexer(day, lat, lon).
+    """
+    return (
+        da_dayhour
+        .isel(hour=hour_indexer)
+        .reset_coords(drop=True)
+        .rename(out_name)
+    )
+
+# --------------------------------------------------
+# MONTHLY PROCESSOR
+# --------------------------------------------------
+def process_one_file(path):
+    print(f"Opening: {path}")
+
+    ds = xr.open_dataset(path, chunks=CHUNKS)
+
+    # Subset AP
+    ds = ds.sel(
+        latitude=slice(LAT_MAX, LAT_MIN),   # descending latitude
+        longitude=slice(LON_MIN, LON_MAX)
+    )
+
+    # Base vars
+    t_k = ds["t2m"].astype("float32").rename("t2m_k")
+    t_c = (ds["t2m"] - 273.15).astype("float32").rename("t2m_c")
+    td_c = (ds["d2m"] - 273.15).astype("float32").rename("d2m_c")
+    sp = ds["sp"].astype("float32").rename("sp_pa")
+
+    # Derived humidity diagnostics
+    q = xr.apply_ufunc(
+        specific_humidity_from_td_sp,
+        td_c, sp,
+        dask="parallelized",
+        output_dtypes=[np.float32]
+    ).rename("q")
+
+    rh = xr.apply_ufunc(
+        rh_from_t_td,
+        t_c, td_c,
+        dask="parallelized",
+        output_dtypes=[np.float32]
+    ).clip(0, 100).rename("rh")
+
+    # WBT
+    wbt = (
+    xr.apply_ufunc(
+            thermo.adiabatic_wet_bulb_temperature,
+            sp, t_k, q,
+            dask="parallelized",
+            output_dtypes=[np.float32]
+        ) - 273.15
+    ).astype("float32").rename("wbt")
+
+    # Stickiness
+    tau = xr.apply_ufunc(
+        stickiness_equation.stickiness,
+        t_c, q,
+        dask="parallelized",
+        output_dtypes=[np.float32]
+    ).rename("tau")
+
+    t_c.attrs["units"] = "degC"
+    td_c.attrs["units"] = "degC"
+    q.attrs["units"] = "kg kg-1"
+    rh.attrs["units"] = "%"
+    tau.attrs["units"] = "degC"
+    wbt.attrs["units"] = "degC"
+    sp.attrs["units"] = "Pa"
+    
+    # Convert all variables to day-hour form
+    t_dh = to_day_hour(t_c)
+    q_dh = to_day_hour(q)
+    rh_dh = to_day_hour(rh)
+    wbt_dh = to_day_hour(wbt)
+    tau_dh = to_day_hour(tau)
+
+    # ----------------------------
+    # WBT daily peak and peak hour
+    # ----------------------------
+    wbt_peak, wbt_hour_peak, wbt_imax = daily_peak_and_hour(wbt_dh, "wbt")
+
+    # ----------------------------
+    # T daily peak and T at peak WBT
+    # ----------------------------
+    t_peak, t_hour_peak, t_imax = daily_peak_and_hour(t_dh, "t2m")
+    t_at_peak_wbt = value_at_given_hour(t_dh, wbt_imax, "t2m_at_wbt_daily_peak")
+
+    # ----------------------------
+    # q daily peak and q at peak WBT
+    # ----------------------------
+    q_peak, q_hour_peak, q_imax = daily_peak_and_hour(q_dh, "q")
+    q_at_peak_wbt = value_at_given_hour(q_dh, wbt_imax, "q_at_wbt_daily_peak")
+
+    # ----------------------------
+    # RH daily peak and RH at peak WBT
+    # ----------------------------
+    rh_peak, rh_hour_peak, rh_imax = daily_peak_and_hour(rh_dh, "rh")
+    rh_at_peak_wbt = value_at_given_hour(rh_dh, wbt_imax, "rh_at_wbt_daily_peak")
+
+    # ----------------------------
+    # tau daily peak and tau at peak WBT
+    # ----------------------------
+    tau_peak, tau_hour_peak, tau_imax = daily_peak_and_hour(tau_dh, "tau")
+    tau_at_peak_wbt = value_at_given_hour(tau_dh, wbt_imax, "tau_at_wbt_daily_peak")
+
+    # Also useful: hour of WBT peak explicitly saved
+    hour_of_wbt_peak = wbt_hour_peak.rename("hour_of_wbt_daily_peak")
+
+    # Build output dataset
+    out = xr.Dataset(
+        {
+            # WBT
+            "wbt_daily_peak": wbt_peak,
+            "hour_of_wbt_daily_peak": hour_of_wbt_peak,
+
+            # Temperature
+            "t2m_daily_peak": t_peak,
+            "hour_of_t2m_daily_peak": t_hour_peak,
+            "t2m_at_wbt_daily_peak": t_at_peak_wbt,
+
+            # Specific humidity
+            "q_daily_peak": q_peak,
+            "hour_of_q_daily_peak": q_hour_peak,
+            "q_at_wbt_daily_peak": q_at_peak_wbt,
+
+            # Relative humidity
+            "rh_daily_peak": rh_peak,
+            "hour_of_rh_daily_peak": rh_hour_peak,
+            "rh_at_wbt_daily_peak": rh_at_peak_wbt,
+
+            # Stickiness
+            "tau_daily_peak": tau_peak,
+            "hour_of_tau_daily_peak": tau_hour_peak,
+            "tau_at_wbt_daily_peak": tau_at_peak_wbt,
+        }
+    )
+
+    # Metadata
+    out.attrs["description"] = (
+        "Daily peak-state dataset over the Arabian Peninsula derived from hourly "
+        "t2m, d2m, and surface pressure. Includes daily peak WBT, temperature, "
+        "specific humidity, relative humidity, and stickiness, plus values of "
+        "temperature, q, RH, and tau at the hour of daily peak WBT."
+    )
+    out.attrs["subset"] = f"lat={LAT_MIN} to {LAT_MAX}, lon={LON_MIN} to {LON_MAX}"
+    out.attrs["source_file"] = os.path.basename(path)
+
+    out["wbt_daily_peak"].attrs.update({
+        "long_name": "Daily peak wet-bulb temperature",
+        "units": "degC"
+    })
+    out["hour_of_wbt_daily_peak"].attrs.update({
+        "long_name": "Hour of daily peak wet-bulb temperature",
+        "units": "hour"
+    })
+
+    out.attrs["created_by"] = "all_data_creation.py"
+    out.attrs["author"] = "Daniel Bose"
+
+    # Compression
+    encoding = {}
+    for v in out.data_vars:
+        if "hour_of_" in v:
+            encoding[v] = {
+                "zlib": True,
+                "complevel": 4,
+                "dtype": "float32",
+                "_FillValue": np.float32(np.nan),
+            }
+        else:
+            encoding[v] = {
+                "zlib": True,
+                "complevel": 4,
+                "dtype": "float32",
+                "_FillValue": np.float32(np.nan),
+            }
+
+    # Output filename
+    base = os.path.basename(path).replace("WetBulbTempInput-", "DailyPeakState-")
+    out_path = os.path.join(OUT_DIR, base)
+
+    print(f"Writing: {out_path}")
+    out.to_netcdf(out_path, encoding=encoding)
+
+    return out_path
+
+# --------------------------------------------------
+# MAIN
+# --------------------------------------------------
+if __name__ == "__main__":
+    files = sorted(glob.glob(IN_GLOB))
+    print(f"Found {len(files)} files")
+    
+    for f in files:
+        process_one_file(f)
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
