@@ -1,17 +1,73 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # coding: utf-8
+'''
+============================================================
+MODEL 2 OF 6 — SUPPLEMENTAL ANALYSIS SUPPORTING SECTION 2.2
+Daily POT/GPD exceedance magnitude as a function of RONI and DMI
+============================================================
 
-# In[ ]:
+SCIENTIFIC PURPOSE
+------------------
+Estimate how lagged ENSO and Indian Ocean Dipole conditions alter the
+magnitude distribution of daily maximum wet-bulb temperature exceedances,
+conditional on an exceedance having occurred. This complements the
+Section 2.2 Bernoulli occurrence model and supports the supplemental figure.
 
+MODELING CHOICES
+----------------
+1. POT response: z_t = wbt_daily_peak_t - u_c for days above a
+   city-specific JJAS threshold u_c. The default threshold is the p95 of
+   valid, lag-aligned daily values and is treated as fixed.
+2. Conditional interpretation: this model addresses exceedance magnitude,
+   not exceedance occurrence. The Bernoulli model separately addresses
+   occurrence probability.
+3. Spatial sampling: nearest model grid cell to each city coordinate.
+4. Season: June-September by default; configurable with --months.
+5. Remote covariates: monthly RONI lagged 2 months and DMI lagged 1 month.
+   Both are standardized after lagging. Each exceedance event inherits the
+   corresponding monthly values.
+6. GPD parameterization:
+      z_t ~ GPD(sigma_t, xi)
+      log(sigma_t) = a + bN*N_t + bD*D_t + bND*(N_t*D_t)
+   Covariates affect scale only; shape xi is constant within each fit.
+7. Shape prior and support: xi ~ TruncatedNormal(0.05, 0.15),
+   constrained to [-0.3, 0.5]. The likelihood explicitly enforces
+   1 + xi*z/sigma > 0.
+8. Scale priors: intercept Normal(0,1); standardized-covariate slopes
+   Normal(0,0.5). The log link guarantees positive scale.
+9. Partial pooling: Doha, Dubai, and Dammam are modeled jointly with
+   non-centered hierarchical city effects and one shared xi. Other cities
+   are fit independently. This is a scientific pooling choice based on their
+   shared Persian Gulf coastal setting.
+10. Declustering: OFF by default, matching the manuscript analysis. With
+    --decluster, a runs rule retains the first exceedance separated by more
+    than --run-length-days. No residual temporal dependence is otherwise
+    modeled, and monthly covariates repeat across events in the same month.
+11. Minimum sample: fits require at least --min-events exceedances.
+12. Posterior intervals: 94% highest-density intervals.
+13. Scenario interpretation: post-processing changes the fitted GPD scale
+    under fixed standardized RONI/DMI combinations, holds xi fixed within
+    each posterior draw, and reports changes in conditional GPD p95 and p99.
 
-# ============================================================
-# Daily POT/GPD vs RONI & DMI (monthly covariates), by city
-#   - single-cell per city
-#   - partial pooling ONLY for Doha + Dubai
-#   - variable-agnostic version for running WBT / HI / tau / etc.
-#   - outputs: one CSV with posterior summaries for each run
-# ============================================================
+OUTPUTS — EXISTING LOCATIONS RETAINED
+-------------------------------------
+Existing:
+  idata_<run_id>.nc
+  <var>_daily_gpd_city_roni_dmi_summary.csv
+Added under OUT_DIR/posterior_checks/:
+  posterior_diagnostics_summary.csv
+  posterior_predictive_summary.csv
+  diagnostics_<run_id>.csv
+  ppc_<run_id>.csv
+  trace_<run_id>.png
+  ppc_<run_id>.png
 
+Posterior checks include R-hat, bulk/tail ESS, divergences, tree-depth hits,
+BFMI, and inverse-CDF GPD posterior-predictive checks of exceedance mean,
+median, p95, and maximum. Diagnostic flags identify runs requiring review;
+they do not replace scientific inspection of trace and predictive plots.
+============================================================
+'''
 import os
 import glob
 import argparse
@@ -22,6 +78,7 @@ import xarray as xr
 import pymc as pm
 import pytensor.tensor as pt
 import arviz as az
+import matplotlib.pyplot as plt
 
 # -----------------------
 # CLI
@@ -49,6 +106,11 @@ def parse_args():
     p.add_argument("--cores", type=int, default=4)
     p.add_argument("--target-accept", type=float, default=0.995)
     p.add_argument("--seed", type=int, default=72)
+    p.add_argument("--max-rhat", type=float, default=1.01)
+    p.add_argument("--min-ess", type=float, default=400)
+    p.add_argument("--min-bfmi", type=float, default=0.30)
+    p.add_argument("--ppc-draws", type=int, default=500,
+                   help="Posterior draws used for inverse-CDF predictive checks")
     return p.parse_args()
 
 args = parse_args()
@@ -76,6 +138,16 @@ OUT_DIR = args.out_dir or os.path.join(BASE_DIR, f"{VAR}_daily_city_runs")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 OUT_CSV = os.path.join(OUT_DIR, f"{VAR}_daily_gpd_city_roni_dmi_summary.csv")
+
+CHECK_DIR = os.path.join(OUT_DIR, "posterior_checks")
+os.makedirs(CHECK_DIR, exist_ok=True)
+DIAGNOSTICS_CSV = os.path.join(CHECK_DIR, "posterior_diagnostics_summary.csv")
+PPC_CSV = os.path.join(CHECK_DIR, "posterior_predictive_summary.csv")
+
+MAX_RHAT = args.max_rhat
+MIN_ESS = args.min_ess
+MIN_BFMI = args.min_bfmi
+PPC_DRAWS = args.ppc_draws
 
 RANDOM_SEED = args.seed
 
@@ -196,6 +268,247 @@ def summarize_param(post, name, hdi=0.94):
     lo, hi = az.hdi(arr, hdi_prob=hdi)
     return mean, float(lo), float(hi)
 
+
+# -----------------------
+# Standardized posterior checks
+# -----------------------
+def core_parameter_names(idata):
+    candidates = [
+        "xi", "a", "bN", "bD", "bND",
+        "a_bar", "bN_bar", "bD_bar", "bND_bar",
+        "a_sd", "bN_sd", "bD_sd", "bND_sd",
+        "a_s", "bN_s", "bD_s", "bND_s",
+    ]
+    return [name for name in candidates if name in idata.posterior]
+
+
+def scalar_diagnostic_summary(idata, run_id):
+    var_names = core_parameter_names(idata)
+    summary = az.summary(
+        idata,
+        var_names=var_names,
+        kind="diagnostics",
+        round_to=None,
+    )
+
+    max_rhat = float(np.nanmax(summary["r_hat"].to_numpy()))
+    min_ess_bulk = float(np.nanmin(summary["ess_bulk"].to_numpy()))
+    min_ess_tail = float(np.nanmin(summary["ess_tail"].to_numpy()))
+
+    stats = idata.sample_stats
+    divergences = int(stats["diverging"].sum().values)
+
+    if "reached_max_treedepth" in stats:
+        treedepth_hits = int(stats["reached_max_treedepth"].sum().values)
+    else:
+        treedepth_hits = 0
+
+    min_bfmi = float(np.nanmin(np.asarray(az.bfmi(idata), dtype=float)))
+
+    flags = []
+    if max_rhat > MAX_RHAT:
+        flags.append(f"rhat>{MAX_RHAT}")
+    if min_ess_bulk < MIN_ESS:
+        flags.append(f"bulk_ess<{MIN_ESS:g}")
+    if min_ess_tail < MIN_ESS:
+        flags.append(f"tail_ess<{MIN_ESS:g}")
+    if divergences > 0:
+        flags.append("divergences")
+    if treedepth_hits > 0:
+        flags.append("max_treedepth")
+    if min_bfmi < MIN_BFMI:
+        flags.append(f"bfmi<{MIN_BFMI}")
+
+    summary.to_csv(os.path.join(CHECK_DIR, f"diagnostics_{run_id}.csv"))
+    return {
+        "run_id": run_id,
+        "max_rhat": max_rhat,
+        "min_ess_bulk": min_ess_bulk,
+        "min_ess_tail": min_ess_tail,
+        "divergences": divergences,
+        "max_treedepth_hits": treedepth_hits,
+        "min_bfmi": min_bfmi,
+        "diagnostic_status": "PASS" if not flags else "REVIEW",
+        "diagnostic_flags": ";".join(flags),
+    }
+
+
+def gpd_random_from_posterior(sigma, xi, rng):
+    """Generate GPD variates by inverse CDF for arrays [draw,event]."""
+    sigma = np.asarray(sigma, dtype=float)
+    xi = np.asarray(xi, dtype=float)
+    u = rng.uniform(np.finfo(float).eps, 1.0 - np.finfo(float).eps, size=sigma.shape)
+    xi_event = np.broadcast_to(xi[:, None], sigma.shape)
+
+    near_zero = np.abs(xi_event) < 1e-6
+    out = np.empty_like(sigma)
+    out[near_zero] = -sigma[near_zero] * np.log1p(-u[near_zero])
+    out[~near_zero] = (
+        sigma[~near_zero] / xi_event[~near_zero]
+        * ((1.0 - u[~near_zero]) ** (-xi_event[~near_zero]) - 1.0)
+    )
+    return out
+
+
+def predictive_stat_rows(run_id, group, observed, replicated):
+    stats = {
+        "mean": lambda x: np.mean(x, axis=-1),
+        "median": lambda x: np.median(x, axis=-1),
+        "p95": lambda x: np.quantile(x, 0.95, axis=-1),
+        "maximum": lambda x: np.max(x, axis=-1),
+    }
+    rows = []
+    for stat_name, func in stats.items():
+        obs_value = float(func(observed[None, :])[0])
+        rep_values = np.asarray(func(replicated), dtype=float)
+        lo, hi = az.hdi(rep_values, hdi_prob=0.94)
+        rows.append({
+            "run_id": run_id,
+            "group": group,
+            "statistic": stat_name,
+            "n_events": int(observed.size),
+            "observed": obs_value,
+            "replicated_mean": float(rep_values.mean()),
+            "replicated_hdi_low": float(lo),
+            "replicated_hdi_high": float(hi),
+            "observed_in_94pct_hdi": bool(float(lo) <= obs_value <= float(hi)),
+            "posterior_predictive_p_ge_observed": float(np.mean(rep_values >= obs_value)),
+        })
+    return rows
+
+
+def posterior_predictive_rows(idata, run_id):
+    observed = np.asarray(idata.observed_data["z_like"].values, dtype=float)
+    sigma = (
+        idata.posterior["sigma"]
+        .stack(sample=("chain", "draw"))
+        .transpose("sample", "event")
+        .values
+    )
+    xi = idata.posterior["xi"].stack(sample=("chain", "draw")).values
+
+    total_draws = sigma.shape[0]
+    if PPC_DRAWS < total_draws:
+        select_rng = np.random.default_rng(RANDOM_SEED)
+        selected = np.sort(select_rng.choice(total_draws, size=PPC_DRAWS, replace=False))
+        sigma = sigma[selected, :]
+        xi = xi[selected]
+
+    rng = np.random.default_rng(RANDOM_SEED + 1009)
+    replicated = gpd_random_from_posterior(sigma, xi, rng)
+
+    groups = [("ALL", np.arange(observed.size))]
+    if "s_id" in idata.constant_data:
+        s_id = np.asarray(idata.constant_data["s_id"].values, dtype=int)
+        pooled_cities = next(iter(POOLED_GROUPS.values()))
+        groups.extend(
+            (city, np.where(s_id == s)[0])
+            for s, city in enumerate(pooled_cities)
+        )
+
+    rows = []
+    for group, idx in groups:
+        rows.extend(
+            predictive_stat_rows(
+                run_id,
+                group,
+                observed[idx],
+                replicated[:, idx],
+            )
+        )
+    return rows, observed, replicated
+
+
+def save_trace_plot(idata, run_id):
+    axes = az.plot_trace(
+        idata,
+        var_names=core_parameter_names(idata),
+        compact=True,
+    )
+    fig = np.asarray(axes).ravel()[0].figure
+    fig.suptitle(run_id, fontsize=11)
+    fig.tight_layout()
+    fig.savefig(
+        os.path.join(CHECK_DIR, f"trace_{run_id}.png"),
+        dpi=200,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+
+def save_ppc_plot(observed, replicated, run_id):
+    """ECDF comparison avoids relying on a random method for DensityDist."""
+    fig, ax = plt.subplots(figsize=(6.4, 4.2))
+
+    obs_sorted = np.sort(observed)
+    obs_y = np.arange(1, obs_sorted.size + 1) / obs_sorted.size
+    ax.step(obs_sorted, obs_y, where="post", linewidth=2.0, label="Observed")
+
+    n_show = min(100, replicated.shape[0])
+    show_idx = np.linspace(0, replicated.shape[0] - 1, n_show, dtype=int)
+    for i in show_idx:
+        rep_sorted = np.sort(replicated[i])
+        rep_y = np.arange(1, rep_sorted.size + 1) / rep_sorted.size
+        ax.step(rep_sorted, rep_y, where="post", linewidth=0.5, alpha=0.10)
+
+    ax.set_xlabel("Exceedance magnitude")
+    ax.set_ylabel("Empirical cumulative probability")
+    ax.set_title(f"GPD posterior predictive ECDF: {run_id}")
+    ax.grid(alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(
+        os.path.join(CHECK_DIR, f"ppc_{run_id}.png"),
+        dpi=200,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+
+def run_all_posterior_checks(summary_df):
+    diagnostics_rows = []
+    ppc_rows = []
+
+    base_run_ids = sorted({
+        str(run_id).split(":", 1)[0]
+        for run_id in summary_df["run_id"]
+    })
+
+    for run_id in base_run_ids:
+        nc_path = os.path.join(OUT_DIR, f"idata_{run_id}.nc")
+        if not os.path.exists(nc_path):
+            print(f"WARNING: posterior checks skipped; missing {nc_path}")
+            continue
+
+        print(f"Running posterior checks: {run_id}")
+        idata = az.from_netcdf(nc_path)
+        diagnostics_rows.append(scalar_diagnostic_summary(idata, run_id))
+
+        run_rows, observed, replicated = posterior_predictive_rows(idata, run_id)
+        ppc_rows.extend(run_rows)
+        pd.DataFrame(run_rows).to_csv(
+            os.path.join(CHECK_DIR, f"ppc_{run_id}.csv"),
+            index=False,
+        )
+
+        save_trace_plot(idata, run_id)
+        save_ppc_plot(observed, replicated, run_id)
+
+    diagnostics_df = pd.DataFrame(diagnostics_rows)
+    ppc_df = pd.DataFrame(ppc_rows)
+    diagnostics_df.to_csv(DIAGNOSTICS_CSV, index=False)
+    ppc_df.to_csv(PPC_CSV, index=False)
+
+    print("Wrote posterior diagnostics:", DIAGNOSTICS_CSV)
+    print("Wrote posterior predictive summary:", PPC_CSV)
+    if not diagnostics_df.empty:
+        print("\nPosterior diagnostic status:")
+        print(
+            diagnostics_df[
+                ["run_id", "diagnostic_status", "diagnostic_flags"]
+            ].to_string(index=False)
+        )
+
+
 # -----------------------
 # Load monthly indices
 # -----------------------
@@ -223,8 +536,12 @@ if roni_col is None or dmi_col is None:
 idx = idx.set_index("time").sort_index()
 idx = idx[~idx.index.duplicated(keep="last")]
 
-N_m = idx[roni_col].astype("float32")
-D_m = idx[dmi_col].astype("float32")
+# Assign earlier index months to the later humid-heat month:
+# July receives May RONI and June DMI.
+N_m = idx[roni_col].astype("float32").shift(2)
+D_m = idx[dmi_col].astype("float32").shift(1)
+
+# Standardize after applying the lags.
 N_m = (N_m - N_m.mean()) / N_m.std()
 D_m = (D_m - D_m.mean()) / D_m.std()
 ND_m = (N_m * D_m).astype("float32")
@@ -301,21 +618,40 @@ def build_event_table(t_daily, y_daily):
     Dm = D_m.reindex(mk).values.astype("float32")
     NDm_ = ND_m.reindex(mk).values.astype("float32")
 
-    if np.isnan(Nm).any() or np.isnan(Dm).any():
-        bad = np.isnan(Nm) | np.isnan(Dm)
-        raise ValueError(f"Missing RONI/DMI values for some days. First missing date: {t_daily[bad][0]}")
+    # Remove days without complete lagged index data.
+    valid = np.isfinite(Nm) & np.isfinite(Dm) & np.isfinite(NDm_)
 
+    t_daily = t_daily[valid]
+    y_daily = y_daily[valid]
+    Nm = Nm[valid]
+    Dm = Dm[valid]
+    NDm_ = NDm_[valid]
+
+    if len(y_daily) == 0:
+        raise RuntimeError(
+            "No daily observations remain after lag alignment."
+        )
+
+    # Threshold is calculated from all valid daily observations.
     u = float(np.nanquantile(y_daily, Q))
     exc = y_daily > u
 
     if DECLUSTER:
-        exc_idx = decluster_events(exc, run_len_days=RUN_LENGTH_DAYS)
+        exc_idx = decluster_events(
+            exc,
+            run_len_days=RUN_LENGTH_DAYS,
+        )
         exc = np.zeros_like(exc, dtype=bool)
         exc[exc_idx] = True
 
+    # GPD response consists only of positive exceedance magnitudes.
     z = (y_daily[exc] - u).astype("float32")
+
     if z.size < MIN_EVENTS:
-        raise RuntimeError(f"Too few exceedances: {z.size} (<{MIN_EVENTS}). Lower Q or MIN_EVENTS.")
+        raise RuntimeError(
+            f"Too few exceedances: {z.size} "
+            f"(<{MIN_EVENTS}). Lower Q or MIN_EVENTS."
+        )
 
     return {
         "z": z,
@@ -606,6 +942,8 @@ def main():
     df.to_csv(OUT_CSV, index=False)
     print("✅ wrote summary CSV:", OUT_CSV)
 
+    # 4) standardized convergence and posterior-predictive checks
+    run_all_posterior_checks(df)
+
 if __name__ == "__main__":
     main() 
-

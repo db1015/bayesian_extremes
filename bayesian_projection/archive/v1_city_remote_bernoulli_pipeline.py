@@ -1,61 +1,14 @@
 #!/usr/bin/env python
 # coding: utf-8
-'''
-============================================================
-MODEL 1 OF 6 — MANUSCRIPT SECTION 2.2
-Daily WBT exceedance occurrence as a function of RONI and DMI
-============================================================
 
-SCIENTIFIC PURPOSE
-------------------
-Estimate how lagged ENSO and Indian Ocean Dipole conditions alter the
-probability that daily maximum wet-bulb temperature exceeds a city-specific
-extreme threshold during JJAS.
+# ============================================================
+# Daily exceedance Bernoulli vs RONI & DMI (monthly covariates), by city
+#   - single-cell per city
+#   - partial pooling ONLY for Doha + Dubai + Dammam
+#   - variable-agnostic structure, currently set for wbt_daily_peak
+#   - outputs: one CSV with posterior summaries for each run
+# ============================================================
 
-MODELING CHOICES
-----------------
-1. Outcome: Bernoulli indicator for wbt_daily_peak > city-specific JJAS p95.
-   The threshold is calculated after lag alignment, from all retained years,
-   and is treated as fixed rather than estimated with uncertainty.
-2. Spatial sampling: nearest model grid cell to each city coordinate.
-3. Season: June–September by default; change with --months.
-4. Remote covariates: monthly RONI lagged 2 months and monthly DMI lagged
-   1 month. Lagged series are standardized over their available record.
-   Each daily observation inherits the corresponding lagged monthly values.
-5. Linear predictor:
-      logit(p_t) = a + bN*N_t + bD*D_t + bND*(N_t*D_t)
-6. Partial pooling: only Doha, Dubai, and Dammam are modeled jointly, using
-   non-centered hierarchical city effects. All other cities are fit
-   independently. This pooling choice reflects the shared Persian Gulf
-   coastal setting and is not applied to geographically distinct cities.
-7. Priors: intercept Normal(-3, 2); standardized-covariate slopes Normal(0,1).
-   Hierarchical SD priors are HalfNormal(1.0) for intercepts and
-   HalfNormal(0.7) for slopes.
-8. Dependence limitation: daily outcomes sharing a month repeat the same
-   monthly covariates. No explicit daily autocorrelation, monthly random
-   effect, or declustering term is included.
-9. Posterior intervals: 94% highest-density intervals.
-10. Sampling: NUTS with user-configurable draws, tuning, chains, target_accept,
-    and seed. Posterior predictive draws are generated after every fit.
-
-OUTPUTS — EXISTING LOCATIONS RETAINED
--------------------------------------
-Existing:
-  idata_<run_id>.nc
-  <var>_daily_bernoulli_city_roni_dmi_summary.csv
-Added posterior checks, under OUT_DIR/posterior_checks/:
-  posterior_diagnostics_summary.csv
-  posterior_predictive_summary.csv
-  diagnostics_<run_id>.csv
-  ppc_<run_id>.csv
-  trace_<run_id>.png
-  ppc_<run_id>.png
-
-Numerical checks flag R-hat > 1.01, bulk/tail ESS < 400, divergences,
-and low BFMI (<0.30). These are audit flags, not automatic proof of model
-adequacy; trace and posterior-predictive plots must also be inspected.
-============================================================
-'''
 import os
 import glob
 import argparse
@@ -64,8 +17,8 @@ import pandas as pd
 import xarray as xr
 
 import pymc as pm
+import pytensor.tensor as pt
 import arviz as az
-import matplotlib.pyplot as plt
 
 # -----------------------
 # CLI
@@ -91,12 +44,6 @@ def parse_args():
     p.add_argument("--cores", type=int, default=4)
     p.add_argument("--target-accept", type=float, default=0.95)
     p.add_argument("--seed", type=int, default=72)
-    p.add_argument("--max-rhat", type=float, default=1.01,
-                   help="Diagnostic flag threshold for maximum R-hat")
-    p.add_argument("--min-ess", type=float, default=400,
-                   help="Diagnostic flag threshold for minimum bulk/tail ESS")
-    p.add_argument("--min-bfmi", type=float, default=0.30,
-                   help="Diagnostic flag threshold for minimum chain BFMI")
     return p.parse_args()
 
 args = parse_args()
@@ -124,14 +71,6 @@ OUT_DIR = args.out_dir or os.path.join(BASE_DIR, f"{VAR}_daily_city_runs_bernoul
 os.makedirs(OUT_DIR, exist_ok=True)
 
 OUT_CSV = os.path.join(OUT_DIR, f"{VAR}_daily_bernoulli_city_roni_dmi_summary.csv")
-CHECK_DIR = os.path.join(OUT_DIR, "posterior_checks")
-os.makedirs(CHECK_DIR, exist_ok=True)
-DIAGNOSTICS_CSV = os.path.join(CHECK_DIR, "posterior_diagnostics_summary.csv")
-PPC_CSV = os.path.join(CHECK_DIR, "posterior_predictive_summary.csv")
-
-MAX_RHAT = args.max_rhat
-MIN_ESS = args.min_ess
-MIN_BFMI = args.min_bfmi
 
 RANDOM_SEED = args.seed
 Q = args.q
@@ -221,171 +160,6 @@ def summarize_param(post, name, hdi=0.94):
 
 def logistic(x):
     return 1.0 / (1.0 + np.exp(-x))
-
-
-def core_parameter_names(idata):
-    """Return scientifically interpreted parameters, excluding day-level p."""
-    candidates = [
-        "a", "bN", "bD", "bND",
-        "a_bar", "bN_bar", "bD_bar", "bND_bar",
-        "a_sd", "bN_sd", "bD_sd", "bND_sd",
-        "a_s", "bN_s", "bD_s", "bND_s",
-    ]
-    return [name for name in candidates if name in idata.posterior]
-
-
-def scalar_diagnostic_summary(idata, run_id):
-    """Calculate standard NUTS convergence diagnostics for one fitted run."""
-    var_names = core_parameter_names(idata)
-    summary = az.summary(
-        idata,
-        var_names=var_names,
-        kind="diagnostics",
-        round_to=None,
-    )
-
-    max_rhat = float(np.nanmax(summary["r_hat"].to_numpy()))
-    min_ess_bulk = float(np.nanmin(summary["ess_bulk"].to_numpy()))
-    min_ess_tail = float(np.nanmin(summary["ess_tail"].to_numpy()))
-
-    sample_stats = idata.sample_stats
-    divergences = int(sample_stats["diverging"].sum().values)
-
-    if "reached_max_treedepth" in sample_stats:
-        max_treedepth_hits = int(sample_stats["reached_max_treedepth"].sum().values)
-    else:
-        max_treedepth_hits = 0
-
-    bfmi = np.asarray(az.bfmi(idata), dtype=float)
-    min_bfmi = float(np.nanmin(bfmi))
-
-    flags = []
-    if max_rhat > MAX_RHAT:
-        flags.append(f"rhat>{MAX_RHAT}")
-    if min_ess_bulk < MIN_ESS:
-        flags.append(f"bulk_ess<{MIN_ESS:g}")
-    if min_ess_tail < MIN_ESS:
-        flags.append(f"tail_ess<{MIN_ESS:g}")
-    if divergences > 0:
-        flags.append("divergences")
-    if max_treedepth_hits > 0:
-        flags.append("max_treedepth")
-    if min_bfmi < MIN_BFMI:
-        flags.append(f"bfmi<{MIN_BFMI}")
-
-    row = {
-        "run_id": run_id,
-        "max_rhat": max_rhat,
-        "min_ess_bulk": min_ess_bulk,
-        "min_ess_tail": min_ess_tail,
-        "divergences": divergences,
-        "max_treedepth_hits": max_treedepth_hits,
-        "min_bfmi": min_bfmi,
-        "diagnostic_status": "PASS" if not flags else "REVIEW",
-        "diagnostic_flags": ";".join(flags),
-    }
-
-    detail_path = os.path.join(CHECK_DIR, f"diagnostics_{run_id}.csv")
-    summary.to_csv(detail_path)
-    return row
-
-
-def posterior_predictive_rows(idata, run_id):
-    """Compare observed and replicated exceedance rates overall and by pooled city."""
-    observed = np.asarray(idata.observed_data["exc_like"].values).astype(float)
-    replicated = np.asarray(idata.posterior_predictive["exc_like"].values).astype(float)
-    replicated = replicated.reshape(-1, replicated.shape[-1])
-
-    groups = [("ALL", np.arange(observed.size))]
-    if "s_id" in idata.constant_data:
-        s_id = np.asarray(idata.constant_data["s_id"].values).astype(int)
-        pooled_cities = next(iter(POOLED_GROUPS.values()))
-        groups.extend((city, np.where(s_id == s)[0]) for s, city in enumerate(pooled_cities))
-
-    rows = []
-    for label, idxs in groups:
-        obs_rate = float(observed[idxs].mean())
-        rep_rate = replicated[:, idxs].mean(axis=1)
-        lo, hi = az.hdi(rep_rate, hdi_prob=0.94)
-        posterior_p = float(np.mean(rep_rate >= obs_rate))
-        covered = bool(float(lo) <= obs_rate <= float(hi))
-        rows.append({
-            "run_id": run_id,
-            "group": label,
-            "n_observations": int(len(idxs)),
-            "observed_exceedance_rate": obs_rate,
-            "replicated_rate_mean": float(rep_rate.mean()),
-            "replicated_rate_hdi_low": float(lo),
-            "replicated_rate_hdi_high": float(hi),
-            "observed_rate_in_94pct_hdi": covered,
-            "posterior_predictive_p_ge_observed": posterior_p,
-        })
-    return rows
-
-
-def save_trace_plot(idata, run_id):
-    var_names = core_parameter_names(idata)
-    axes = az.plot_trace(idata, var_names=var_names, compact=True)
-    fig = np.asarray(axes).ravel()[0].figure
-    fig.suptitle(run_id, fontsize=11)
-    fig.tight_layout()
-    out = os.path.join(CHECK_DIR, f"trace_{run_id}.png")
-    fig.savefig(out, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-
-def save_ppc_plot(idata, run_id):
-    ax = az.plot_ppc(
-        idata,
-        data_pairs={"exc_like": "exc_like"},
-        kind="cumulative",
-        num_pp_samples=200,
-        random_seed=RANDOM_SEED,
-    )
-    fig = ax.figure
-    ax.set_title(f"Posterior predictive check: {run_id}")
-    fig.tight_layout()
-    out = os.path.join(CHECK_DIR, f"ppc_{run_id}.png")
-    fig.savefig(out, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-
-def run_all_posterior_checks(summary_df):
-    """Load each unique fitted posterior and write standardized audit outputs."""
-    diagnostics_rows = []
-    ppc_rows = []
-
-    base_run_ids = []
-    for run_id in summary_df["run_id"].astype(str):
-        base_run_ids.append(run_id.split(":", 1)[0])
-
-    for run_id in sorted(set(base_run_ids)):
-        nc_path = os.path.join(OUT_DIR, f"idata_{run_id}.nc")
-        if not os.path.exists(nc_path):
-            print(f"WARNING: posterior checks skipped; missing {nc_path}")
-            continue
-
-        print(f"Running posterior checks: {run_id}")
-        idata = az.from_netcdf(nc_path)
-        diagnostics_rows.append(scalar_diagnostic_summary(idata, run_id))
-        run_ppc_rows = posterior_predictive_rows(idata, run_id)
-        ppc_rows.extend(run_ppc_rows)
-        pd.DataFrame(run_ppc_rows).to_csv(
-            os.path.join(CHECK_DIR, f"ppc_{run_id}.csv"), index=False
-        )
-        save_trace_plot(idata, run_id)
-        save_ppc_plot(idata, run_id)
-
-    diagnostics_df = pd.DataFrame(diagnostics_rows)
-    ppc_df = pd.DataFrame(ppc_rows)
-    diagnostics_df.to_csv(DIAGNOSTICS_CSV, index=False)
-    ppc_df.to_csv(PPC_CSV, index=False)
-
-    print("Wrote posterior diagnostics:", DIAGNOSTICS_CSV)
-    print("Wrote posterior predictive summary:", PPC_CSV)
-    if not diagnostics_df.empty:
-        print("\nPosterior diagnostic status:")
-        print(diagnostics_df[["run_id", "diagnostic_status", "diagnostic_flags"]].to_string(index=False))
 
 # -----------------------
 # Load monthly indices
@@ -562,13 +336,6 @@ def fit_single_city(run_id, city_name, tbl, out_dir):
             random_seed=RANDOM_SEED,
         )
 
-        pm.sample_posterior_predictive(
-            idata,
-            var_names=["exc_like"],
-            extend_inferencedata=True,
-            random_seed=RANDOM_SEED,
-        )
-
     out_nc = os.path.join(out_dir, f"idata_{run_id}.nc")
     az.to_netcdf(idata, out_nc)
     print("✅ saved", out_nc)
@@ -696,13 +463,6 @@ def fit_pooled_group(run_id, cities, tables, out_dir):
             chains=CHAINS,
             cores=CORES,
             target_accept=TARGET_ACCEPT,
-            random_seed=RANDOM_SEED,
-        )
-
-        pm.sample_posterior_predictive(
-            idata,
-            var_names=["exc_like"],
-            extend_inferencedata=True,
             random_seed=RANDOM_SEED,
         )
 
@@ -879,9 +639,6 @@ def main():
     df.to_csv(OUT_CSV, index=False)
     print("✅ wrote summary CSV:", OUT_CSV)
 
-
-    # 4) standardized numerical, trace, and posterior-predictive checks
-    run_all_posterior_checks(df)
-
 if __name__ == "__main__":
     main()
+

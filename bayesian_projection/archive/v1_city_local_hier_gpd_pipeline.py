@@ -23,7 +23,7 @@
 #   JJAS only
 #
 # Cities:
-#   muscat, doha, dubai, jeddah, aden
+#   muscat, doha, dubai, jeddah, aden, dammam, kuwait city, basra
 # ============================================================
 
 import os
@@ -46,20 +46,27 @@ import arviz as az
 NETID = "k16v981"
 
 CITIES = {
-    "muscat": {"lat": 23.5880, "lon": 58.3829},
-    "doha":   {"lat": 25.2854, "lon": 51.5310},
-    "dubai":  {"lat": 25.2048, "lon": 55.2708},
-    "jeddah": {"lat": 21.4858, "lon": 39.1925},
-    "aden":   {"lat": 12.7855, "lon": 45.0187},
+    "muscat":      {"lat": 23.5880, "lon": 58.3829},
+    "doha":        {"lat": 25.2854, "lon": 51.5310},
+    "dubai":       {"lat": 25.2048, "lon": 55.2708},
+    "kuwait_city": {"lat": 29.3759, "lon": 47.9774},
+    "basra":       {"lat": 30.5085, "lon": 47.7835},
+    "jeddah":      {"lat": 21.4858, "lon": 39.1925},
+    "aden":        {"lat": 12.7855, "lon": 45.0187},
+    "dammam":       {"lat": 26.4207, "lon": 50.0888},
 }
+
 CITY_LIST = list(CITIES.keys())
 
 CITY_TO_BASIN = {
-    "muscat": "gulf_oman",
-    "doha":   "arabian_gulf",
-    "dubai":  "arabian_gulf",
-    "jeddah": "red_sea",
-    "aden":   "gulf_aden",
+    "muscat":      "gulf_oman",
+    "doha":        "arabian_gulf",
+    "dubai":       "arabian_gulf",
+    "kuwait_city": "arabian_gulf",
+    "basra":       "arabian_gulf",
+    "dammam":      "arabian_gulf",
+    "jeddah":      "red_sea",
+    "aden":        "gulf_aden",
 }
 
 VALID_BASINS = [
@@ -67,6 +74,12 @@ VALID_BASINS = [
     "arabian_gulf",
     "red_sea",
     "gulf_aden",
+]
+
+POOLED_GULF_CITIES = [
+    "doha",
+    "dubai",
+    "dammam",
 ]
 
 VALID_TARGET_VARS = [
@@ -98,10 +111,10 @@ CORES = 4
 TARGET_ACCEPT = 0.98
 
 WARMING_EXPTS = {
+    "+0.5C": 0.5,
     "+1C": 1.0,
+    "+1.5C": 1.5,
     "+2C": 2.0,
-    "+3C": 3.0,
-    "+4C": 4.0,
 }
 Q_LEVELS = [0.95, 0.99]
 
@@ -312,26 +325,59 @@ def fit_one(target_var, basin):
     if basin not in VALID_BASINS:
         raise ValueError(f"basin must be one of {VALID_BASINS}")
 
+    # Only include cities assigned to this basin
+    basin_cities = [
+        city for city in CITY_LIST
+        if CITY_TO_BASIN[city] == basin
+    ]
+
+    # Only Doha, Dubai, and Dammam partially pool
+    pooled_cities = [
+        city for city in basin_cities
+        if city in POOLED_GULF_CITIES
+    ]
+
+    # Kuwait City and Basra remain independent
+    independent_cities = [
+        city for city in basin_cities
+        if city not in pooled_cities
+    ]
+
     print("=" * 72)
-    print(f"Running fit_one")
-    print(f"TARGET_VAR = {target_var}")
-    print(f"BASIN      = {basin}")
-    print(f"MONTHS     = {MONTHS}")
+    print("Running fit_one")
+    print(f"TARGET_VAR       = {target_var}")
+    print(f"BASIN            = {basin}")
+    print(f"MONTHS           = {MONTHS}")
+    print(f"BASIN CITIES     = {basin_cities}")
+    print(f"POOLED CITIES    = {pooled_cities}")
+    print(f"INDEPENDENT      = {independent_cities}")
     print("=" * 72)
 
     files = sorted(glob.glob(WBT_GLOB))
     if not files:
-        raise FileNotFoundError(f"No DailyPeakState files found: {WBT_GLOB}")
+        raise FileNotFoundError(
+            f"No DailyPeakState files found: {WBT_GLOB}"
+        )
 
     sst_m = load_basin_sst_monthly(basin)
 
-    z_list, sst_list, city_id_list = [], [], []
+    z_list = []
+    sst_list = []
+    city_id_list = []
+
     u_by_city = {}
     n_days_by_city = {}
     n_exc_by_city = {}
 
-    for ci, city in enumerate(CITY_LIST):
-        t, y = load_city_daily(files, city, CITIES[city]["lat"], CITIES[city]["lon"], target_var)
+    for ci, city in enumerate(basin_cities):
+        t, y = load_city_daily(
+            files,
+            city,
+            CITIES[city]["lat"],
+            CITIES[city]["lon"],
+            target_var,
+        )
+
         n_days_by_city[city] = int(len(y))
 
         u = float(np.nanquantile(y, Q))
@@ -339,33 +385,66 @@ def fit_one(target_var, basin):
         z = (y[exc] - u).astype("float32")
 
         if z.size < MIN_EVENTS:
-            raise RuntimeError(f"{city}: too few exceedances ({z.size} < {MIN_EVENTS}). Lower Q or MIN_EVENTS.")
+            raise RuntimeError(
+                f"{city}: too few exceedances "
+                f"({z.size} < {MIN_EVENTS}). "
+                "Lower Q or MIN_EVENTS."
+            )
 
         mk = month_key_daily(t)
         sst_day = sst_m.reindex(mk).values.astype("float32")
+
         if np.isnan(sst_day).any():
             bad = np.isnan(sst_day)
-            raise ValueError(f"{city}: missing SST for some JJAS days. First missing date={t[bad][0]}")
+            raise ValueError(
+                f"{city}: missing SST for some JJAS days. "
+                f"First missing date={t[bad][0]}"
+            )
 
         sst_e = sst_day[exc]
 
         z_list.append(z)
         sst_list.append(sst_e)
-        city_id_list.append(np.full(z.size, ci, dtype="int32"))
+        city_id_list.append(
+            np.full(z.size, ci, dtype="int32")
+        )
 
         u_by_city[city] = u
         n_exc_by_city[city] = int(z.size)
 
-        print(f"✅ {city}: days={len(y)} exc={z.size} frac={z.size/len(y):.3f} u={u:.3f}")
+        print(
+            f"✅ {city}: days={len(y)} "
+            f"exc={z.size} "
+            f"frac={z.size / len(y):.3f} "
+            f"u={u:.3f}"
+        )
 
     z_all = np.concatenate(z_list).astype("float32")
     sst_all = np.concatenate(sst_list).astype("float32")
     cid_all = np.concatenate(city_id_list).astype("int32")
 
-    print(f"\n✅ Built pooled event table: E={z_all.size} exceedances across S={len(CITY_LIST)} cities")
-    print(f"✅ SST covariate range: [{np.nanmin(sst_all):.3f}, {np.nanmax(sst_all):.3f}]")
+    print(
+        f"\n✅ Built event table: "
+        f"E={z_all.size} exceedances across "
+        f"S={len(basin_cities)} cities"
+    )
 
-    coords = {"event": np.arange(z_all.size), "city": CITY_LIST}
+    print(
+        f"✅ SST covariate range: "
+        f"[{np.nanmin(sst_all):.3f}, "
+        f"{np.nanmax(sst_all):.3f}]"
+    )
+
+    coords = {
+        "event": np.arange(z_all.size),
+        "city": basin_cities,
+    }
+
+    if pooled_cities:
+        coords["pooled_city"] = pooled_cities
+
+    if independent_cities:
+        coords["independent_city"] = independent_cities
 
     with pm.Model(coords=coords) as model:
         z_obs = pm.ConstantData("z", z_all, dims="event")
@@ -374,17 +453,112 @@ def fit_one(target_var, basin):
 
         xi = pm.TruncatedNormal("xi", mu=0.05, sigma=0.15, lower=XI_LOWER, upper=XI_UPPER)
 
-        a_bar = pm.Normal("a_bar", 0.0, 1.0)
-        b_bar = pm.Normal("b_bar", 0.0, 0.5)
+        city_to_index = {
+            city: i for i, city in enumerate(basin_cities)
+        }
 
-        a_sd = pm.HalfNormal("a_sd", 0.8)
-        b_sd = pm.HalfNormal("b_sd", 0.3)
+        pooled_to_index = {
+            city: i for i, city in enumerate(pooled_cities)
+        }
 
-        a_z = pm.Normal("a_z", 0, 1, dims="city")
-        b_z = pm.Normal("b_z", 0, 1, dims="city")
+        independent_to_index = {
+            city: i for i, city in enumerate(independent_cities)
+        }
 
-        a_city = pm.Deterministic("a_city", a_bar + a_sd * a_z, dims="city")
-        b_city = pm.Deterministic("b_city", b_bar + b_sd * b_z, dims="city")
+        a_values = [None] * len(basin_cities)
+        b_values = [None] * len(basin_cities)
+
+        # -------------------------------------------
+        # Partially pooled: Doha, Dubai, Dammam
+        # -------------------------------------------
+        if pooled_cities:
+            a_bar = pm.Normal(
+                "a_bar",
+                0.0,
+                1.0,
+            )
+            b_bar = pm.Normal(
+                "b_bar",
+                0.0,
+                0.5,
+            )
+
+            a_sd = pm.HalfNormal(
+                "a_sd",
+                0.8,
+            )
+            b_sd = pm.HalfNormal(
+                "b_sd",
+                0.3,
+            )
+
+            a_z = pm.Normal(
+                "a_z",
+                0.0,
+                1.0,
+                dims="pooled_city",
+            )
+            b_z = pm.Normal(
+                "b_z",
+                0.0,
+                1.0,
+                dims="pooled_city",
+            )
+
+            a_pooled = pm.Deterministic(
+                "a_pooled",
+                a_bar + a_sd * a_z,
+                dims="pooled_city",
+            )
+            b_pooled = pm.Deterministic(
+                "b_pooled",
+                b_bar + b_sd * b_z,
+                dims="pooled_city",
+            )
+
+            for city in pooled_cities:
+                city_i = city_to_index[city]
+                pool_i = pooled_to_index[city]
+
+                a_values[city_i] = a_pooled[pool_i]
+                b_values[city_i] = b_pooled[pool_i]
+
+        # -------------------------------------------
+        # Independent: Kuwait City, Basra,
+        # plus all single-city basin fits
+        # -------------------------------------------
+        if independent_cities:
+            a_independent = pm.Normal(
+                "a_independent",
+                0.0,
+                1.0,
+                dims="independent_city",
+            )
+            b_independent = pm.Normal(
+                "b_independent",
+                0.0,
+                0.5,
+                dims="independent_city",
+            )
+
+            for city in independent_cities:
+                city_i = city_to_index[city]
+                independent_i = independent_to_index[city]
+
+                a_values[city_i] = a_independent[independent_i]
+                b_values[city_i] = b_independent[independent_i]
+
+        a_city = pm.Deterministic(
+            "a_city",
+            pt.stack(a_values),
+            dims="city",
+        )
+
+        b_city = pm.Deterministic(
+            "b_city",
+            pt.stack(b_values),
+            dims="city",
+        )
 
         log_sigma = a_city[c_id] + b_city[c_id] * sst_e
         sigma = pm.Deterministic("sigma", 1e-6 + pt.exp(log_sigma), dims="event")
@@ -409,8 +583,13 @@ def fit_one(target_var, basin):
     safe_save_idata(idata, idata_path(target_var, basin))
 
     meta = {
-        "cities": CITY_LIST,
-        "cities_meta": CITIES,
+        "cities": basin_cities,
+        "cities_meta": {
+            city: CITIES[city]
+            for city in basin_cities
+        },
+        "pooled_cities": pooled_cities,
+        "independent_cities": independent_cities,
         "u_by_city": u_by_city,
         "n_days_by_city": n_days_by_city,
         "n_exc_by_city": n_exc_by_city,
