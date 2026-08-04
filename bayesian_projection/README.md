@@ -144,7 +144,7 @@ Evaluates ENSO/IOD experiments across basin grid cells and generates spatial res
 
 ---
 
-## 5. Local basin warming (Section 2.4)
+## 5. Local basin warming (Section 2.5)
 
 **Model**
 
@@ -354,4 +354,5 @@ Department of Earth Sciences
 
 Montana State University
 
+daniel.bose1@student.montana.edu
 daniel.bose1@montana.edu
