@@ -66,7 +66,10 @@ BASIN_DISPLAY = {
 ENSO_LEVELS = [0.0, -1.0, -2.0, -2.5]
 IOD_LEVELS = [-1.0, 0.0, 1.0]
 WARMING_LEVELS = np.arange(0.0, 3.01, 0.5)
-Q_LEVELS = [0.95, 0.99]
+THRESHOLD_PROBABILITY = 0.95
+
+# Quantiles of the complete daily WBT distribution.
+OVERALL_Q_LEVELS = [0.975, 0.99]
 HDI_PROB = 0.94
 
 
@@ -185,6 +188,32 @@ def summarize(values, hdi_prob):
         "hdi_high": float(high),
     }
 
+def overall_to_conditional_probability(
+    overall_probability,
+    threshold_probability=THRESHOLD_PROBABILITY,
+):
+    """
+    Convert a quantile of the full daily distribution to the corresponding
+    quantile of the conditional threshold-exceedance distribution.
+
+    For a p95 POT threshold:
+        overall p97.5 -> conditional p50
+        overall p99   -> conditional p80
+        overall p99.5 -> conditional p90
+    """
+    if overall_probability < threshold_probability:
+        raise ValueError(
+            "The requested overall probability lies below the POT threshold."
+        )
+
+    if overall_probability >= 1.0:
+        raise ValueError("Probability must be less than 1.")
+
+    return (
+        overall_probability - threshold_probability
+    ) / (
+        1.0 - threshold_probability
+    )
 
 def gpd_quantile(threshold, sigma, xi, probability, xi_tol=1e-6):
     sigma, xi = np.broadcast_arrays(
@@ -406,7 +435,14 @@ def build_draw_cache(idata, meta):
     return cache
 
 
-def evaluate_state(cache, city, N, D, warming, probability):
+def evaluate_state(
+    cache,
+    city,
+    N,
+    D,
+    warming,
+    overall_probability,
+):
     basin = CITY_BASINS[city]
     basin_draws = cache["basins"][basin]
     city_draws = cache["cities"][city]
@@ -434,17 +470,23 @@ def evaluate_state(cache, city, N, D, warming, probability):
 
     sigma = np.exp(log_sigma)
 
+    conditional_probability = overall_to_conditional_probability(
+        overall_probability
+    )
+    
     tw_level = gpd_quantile(
         threshold,
         sigma,
         xi,
-        probability,
+        conditional_probability,
     )
 
     return {
         "sst_state": sst_state,
         "sigma": sigma,
         "tw_level": tw_level,
+        "overall_probability": overall_probability,
+        "conditional_probability": conditional_probability,
     }
 
 
@@ -456,13 +498,13 @@ def run_experiments(cache, hdi_prob):
         for N in ENSO_LEVELS:
             for D in IOD_LEVELS:
                 for warming in WARMING_LEVELS:
-                    for probability in Q_LEVELS:
+                    for overall_probability in OVERALL_Q_LEVELS:
                         key = (
                             city,
                             float(N),
                             float(D),
                             float(warming),
-                            float(probability),
+                            float(overall_probability),
                         )
                         state_cache[key] = evaluate_state(
                             cache,
@@ -470,7 +512,7 @@ def run_experiments(cache, hdi_prob):
                             N=float(N),
                             D=float(D),
                             warming=float(warming),
-                            probability=float(probability),
+                            overall_probability = float(overall_probability),
                         )
 
     rows = []
@@ -484,13 +526,13 @@ def run_experiments(cache, hdi_prob):
                 scen_name = scenario_name(N, D)
 
                 for warming in WARMING_LEVELS:
-                    for probability in Q_LEVELS:
+                    for overall_probability in OVERALL_Q_LEVELS:
                         key = (
                             city,
                             float(N),
                             float(D),
                             float(warming),
-                            float(probability),
+                            float(overall_probability),
                         )
 
                         current = state_cache[key]
@@ -501,7 +543,7 @@ def run_experiments(cache, hdi_prob):
                                 0.0,
                                 0.0,
                                 0.0,
-                                float(probability),
+                                float(overall_probability),
                             )
                         ]
 
@@ -511,7 +553,7 @@ def run_experiments(cache, hdi_prob):
                                 float(N),
                                 float(D),
                                 0.0,
-                                float(probability),
+                                float(overall_probability),
                             )
                         ]
 
@@ -521,7 +563,7 @@ def run_experiments(cache, hdi_prob):
                                 0.0,
                                 0.0,
                                 float(warming),
-                                float(probability),
+                                float(overall_probability),
                             )
                         ]
 
@@ -588,7 +630,10 @@ def run_experiments(cache, hdi_prob):
                                 "N_sd": float(N),
                                 "D_sd": float(D),
                                 "basin_warming_C": float(warming),
-                                "conditional_quantile": float(probability),
+                                "overall_quantile": float(overall_probability),
+                                "conditional_gpd_quantile": float(
+                                    current["conditional_probability"]
+                                ),
                                 "threshold_u_C": threshold,
 
                                 "sst_state_mean_C": sst_summary["mean"],
@@ -642,7 +687,7 @@ def run_experiments(cache, hdi_prob):
             "N_sd",
             "D_sd",
             "basin_warming_C",
-            "conditional_quantile",
+            "overall_quantile",
         ]
     ).reset_index(drop=True)
 
@@ -674,7 +719,11 @@ def run_experiment_stage():
     print(f"ENSO levels: {ENSO_LEVELS}")
     print(f"IOD levels: {IOD_LEVELS}")
     print(f"Warming levels: {WARMING_LEVELS.tolist()}")
-    print(f"Conditional quantiles: {Q_LEVELS}")
+    print(f"Overall daily quantiles: {OVERALL_Q_LEVELS}")
+    print(
+        "Corresponding conditional GPD quantiles: "
+        f"{[overall_to_conditional_probability(q) for q in OVERALL_Q_LEVELS]}"
+    )
     print("=" * 78)
 
     cache = build_draw_cache(idata, meta)
@@ -697,7 +746,7 @@ def run_experiment_stage():
         "basin",
         "scenario",
         "basin_warming_C",
-        "conditional_quantile",
+        "overall_quantile",
         "sst_state_mean_C",
         "tw_level_mean_C",
         "delta_total_mean_C",
@@ -714,8 +763,6 @@ def run_experiment_stage():
     )
 
 
-if __name__ == "__main__":
-    main()
 
 # ---------------------------------------------------------------------
 # Plot configuration and rendering
@@ -790,7 +837,7 @@ CITY_LABELS = {
     "aden": "Aden",
 }
 
-QUANTILES = [0.95, 0.99]
+QUANTILES = [0.975, 0.99]
 
 # Each tuple is:
 # (display label, N_sd, D_sd, basin_warming_C)
@@ -818,6 +865,11 @@ def pretty_city(city):
         city.replace("_", " ").title(),
     )
 
+def quantile_label(q):
+    percentile = 100.0 * q
+    if percentile.is_integer():
+        return f"p{int(percentile)}"
+    return f"p{percentile:g}"
 
 def select_scenario_row(df, N, D, warming, quantile):
     """Return exactly one matching experiment row."""
@@ -825,7 +877,7 @@ def select_scenario_row(df, N, D, warming, quantile):
         np.isclose(df["N_sd"], N)
         & np.isclose(df["D_sd"], D)
         & np.isclose(df["basin_warming_C"], warming)
-        & np.isclose(df["conditional_quantile"], quantile)
+        & np.isclose(df["overall_quantile"], quantile)
     ]
 
     if len(match) != 1:
@@ -910,7 +962,7 @@ def plot_compound_figure(show=False):
         "N_sd",
         "D_sd",
         "basin_warming_C",
-        "conditional_quantile",
+        "overall_quantile",
         "tw_level_mean_C",
         "delta_total_mean_C",
         "delta_total_hdi_low_C",
@@ -1070,7 +1122,7 @@ def plot_compound_figure(show=False):
                 0.98,
                 0.95,
                 (
-                    f"p{int(q * 100)}: "
+                    f"{quantile_label(q)}: "
                     f"{reference_level:.2f}$^\\circ$C\n"
                     f"{basin_name}"
                 ),
@@ -1118,7 +1170,7 @@ def plot_compound_figure(show=False):
 
             if i == 0:
                 ax.set_title(
-                    f"Conditional GPD p{int(q * 100)}",
+                    f"Overall daily {quantile_label(q)}",
                     fontsize=9,
                 )
 

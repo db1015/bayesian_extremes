@@ -3,7 +3,7 @@
 '''
 ============================================================
 MODEL 2 OF 6 — SUPPLEMENTAL POST-PROCESSING FOR SECTION 2.2
-Aggregate GPD scenario effects and reproduce the supplemental figure
+Aggregate overall-distribution GPD scenario effects and reproduce the supplemental figure
 ============================================================
 
 PURPOSE
@@ -11,8 +11,8 @@ PURPOSE
 This is the single post-processing entry point for
 city_remote_hier_gpd_pipeline.py. It does not refit the model. It:
   1. reads the existing GPD summary CSV and saved InferenceData files;
-  2. computes changes in conditional GPD p95 and p99 under fixed,
-     standardized RONI/DMI scenarios relative to N=0, D=0;
+  2. computes changes in the reconstructed overall daily p97.5 and p99
+     under fixed, standardized RONI/DMI scenarios relative to N=0, D=0;
   3. writes the existing pointwise-extreme-change CSV; and
   4. reproduces the existing multi-city supplemental PNG and PDF.
 
@@ -22,18 +22,22 @@ POSTERIOR CALCULATION CHOICES
       sigma_0 = exp(a)
       sigma_1 = sigma_0 * exp(bN*N + bD*D + bND*N*D)
    Shape xi and the fitted threshold u are held fixed within that draw.
-2. Reported effects are x_q(scenario) - x_q(neutral), where x_q is the
-   conditional GPD quantile above threshold u. Thus these are changes in
-   exceedance magnitude conditional on occurrence, not changes in event
-   probability or unconditional return levels.
+2. The fitted threshold is the empirical overall p95. Requested overall
+   daily quantiles are converted to conditional GPD probabilities using
+
+       p_tail = (p_overall - 0.95) / 0.05.
+
+   Therefore, overall p97.5 uses conditional GPD p50 and overall p99 uses
+   conditional GPD p80. Reported effects are reconstructed overall-quantile
+   changes, while the threshold-exceedance probability remains fixed at 5%.
 3. The xi -> 0 exponential limit is used for numerical stability.
 4. Uncertainty is summarized with 94% highest-density intervals.
 5. The pooled parameter order must exactly match the fit:
       Doha, Dubai, Dammam.
-6. The small p95/p99 annotations reproduce the prior notebook behavior:
-   they are empirical quantiles from all finite DailyPeakState values at the
-   nearest city cell, without a JJAS restriction. They provide raw-value
-   context but are not the fitted POT threshold except coincidentally.
+6. The small p97.5/p99 annotations reproduce the prior notebook behavior:
+   they are empirical overall quantiles from all finite DailyPeakState values
+   at the nearest city cell, without a JJAS restriction. They provide raw-value
+   context and are separate from the JJAS POT fit.
 
 EXISTING OUTPUT LOCATIONS RETAINED
 ----------------------------------
@@ -114,7 +118,8 @@ SCENARIOS_TO_PLOT = [
     "Super La Niña (-2.5,0)",
 ]
 
-Q_LEVELS = [0.95, 0.99]
+THRESHOLD_PROBABILITY = 0.95
+OVERALL_Q_LEVELS = [0.975, 0.99]
 
 POOLED_SPACE_ORDER = {
     "gulf_coastal_pooled": ["doha", "dubai", "dammam"],
@@ -154,6 +159,30 @@ CITY_COORDS = {
 VAR_LABELS = {
     "wbt_daily_peak": "Wet-Bulb Temperature",
 }
+
+
+
+def overall_to_conditional_probability(
+    overall_probability,
+    threshold_probability=THRESHOLD_PROBABILITY,
+):
+    """Map an overall-distribution quantile to the conditional GPD quantile."""
+    if not threshold_probability <= overall_probability < 1.0:
+        raise ValueError(
+            "Overall probability must be at least the POT threshold "
+            "probability and less than 1."
+        )
+    return (
+        (overall_probability - threshold_probability)
+        / (1.0 - threshold_probability)
+    )
+
+
+def quantile_label(probability):
+    percentile = 100.0 * probability
+    if float(percentile).is_integer():
+        return f"p{int(percentile)}"
+    return f"p{percentile:g}"
 
 
 def gpd_quantile(u, sigma, xi, q, xi_tol=1e-6):
@@ -273,9 +302,10 @@ def compute_impacts_for_var(base_data_dir, var):
             )
             sigma_1 = sigma_0 * np.exp(delta_log_sigma)
 
-            for q in Q_LEVELS:
-                x_0 = gpd_quantile(u, sigma_0, xi, q)
-                x_1 = gpd_quantile(u, sigma_1, xi, q)
+            for overall_q in OVERALL_Q_LEVELS:
+                conditional_q = overall_to_conditional_probability(overall_q)
+                x_0 = gpd_quantile(u, sigma_0, xi, conditional_q)
+                x_1 = gpd_quantile(u, sigma_1, xi, conditional_q)
                 delta = x_1 - x_0
                 low, high = az.hdi(delta, hdi_prob=0.94)
 
@@ -284,7 +314,8 @@ def compute_impacts_for_var(base_data_dir, var):
                     "city": city,
                     "run_id": run_id,
                     "scenario": scenario["name"],
-                    "quantile": q,
+                    "overall_quantile": overall_q,
+                    "conditional_gpd_quantile": conditional_q,
                     "delta_mean": float(delta.mean()),
                     "delta_hdi_low": float(low),
                     "delta_hdi_high": float(high),
@@ -300,7 +331,7 @@ def compute_impacts_for_var(base_data_dir, var):
         result["city"], categories=CITY_ORDER, ordered=True
     )
     result = result.sort_values(
-        ["city", "quantile", "scenario"]
+        ["city", "overall_quantile", "scenario"]
     ).reset_index(drop=True)
 
     out_csv = os.path.join(run_dir, f"{var}_pointwise_extreme_changes.csv")
@@ -353,7 +384,7 @@ def compute_actual_city_quantiles(data_glob, city_coords, var_name):
                     float(np.nanquantile(values, q))
                     if values.size else np.nan
                 )
-                for q in Q_LEVELS
+                for q in OVERALL_Q_LEVELS
             }
         return city_quantiles
     finally:
@@ -389,7 +420,7 @@ def plot_var(impact_df, actual_quantiles, var, fig_dir, show=False):
 
     xlim = compute_global_xlim(impact_df)
     nrows = len(cities)
-    ncols = len(Q_LEVELS)
+    ncols = len(OVERALL_Q_LEVELS)
     fig_height = max(1.75 * nrows + 0.8, 10.5)
 
     fig, axes = plt.subplots(
@@ -417,10 +448,10 @@ def plot_var(impact_df, actual_quantiles, var, fig_dir, show=False):
         city_df = impact_df[impact_df["city"].astype(str) == city]
         color = city_colors[city]
 
-        for j, q in enumerate(Q_LEVELS):
+        for j, q in enumerate(OVERALL_Q_LEVELS):
             ax = axes[i, j]
             sub = (
-                city_df[city_df["quantile"] == q]
+                city_df[city_df["overall_quantile"] == q]
                 .set_index("scenario")
                 .reindex(SCENARIOS_TO_PLOT)
             )
@@ -459,7 +490,7 @@ def plot_var(impact_df, actual_quantiles, var, fig_dir, show=False):
             ax.text(
                 0.98,
                 0.95,
-                f"p{int(q * 100)}: {q_value:.2f}",
+                f"{quantile_label(q)}: {q_value:.2f}",
                 transform=ax.transAxes,
                 ha="right",
                 va="top",
@@ -482,9 +513,9 @@ def plot_var(impact_df, actual_quantiles, var, fig_dir, show=False):
                 ax.set_yticklabels([])
 
             if i == 0:
-                ax.set_title(f"{int(q * 100)}th percentile", fontsize=9)
+                ax.set_title(f"Overall daily {quantile_label(q)}", fontsize=9)
             if i == nrows - 1:
-                ax.set_xlabel("Change in extreme WBT", fontsize=8)
+                ax.set_xlabel("Change in overall daily WBT quantile", fontsize=8)
 
             ax.set_ylim(
                 y[-1] + 1.1 * y_spacing,

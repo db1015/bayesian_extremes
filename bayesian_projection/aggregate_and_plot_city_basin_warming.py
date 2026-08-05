@@ -16,11 +16,11 @@ Pipeline
 For each supported atmospheric target variable, this script:
 
 1. Loads each basin-specific city POT/GPD posterior and metadata file.
-2. Calculates baseline unconditional JJAS p95 and p99 POT quantiles.
+2. Calculates baseline reconstructed overall JJAS p97.5 and p99 POT quantiles.
 3. Reads the existing adjacent-basin warming impact table produced by the
    fitting pipeline's ``aggregate_one_var`` mode.
 4. Retains only each city's assigned adjacent basin.
-5. Produces a two-column p95/p99 figure showing the modeled change under
+5. Produces a two-column overall p97.5/p99 figure showing the modeled change under
    +0.5, +1.0, +1.5, and +2.0 degree Celsius basin-warming experiments.
 6. Writes the baseline quantile CSV and the existing PNG and manuscript PDF.
 
@@ -33,11 +33,13 @@ empirical exceedance probability
 
     zeta_u = n_exceedances / n_days.
 
-The warming-impact CSV contains changes calculated by perturbing the
-basin-SST covariate in the GPD scale model. These experiments do not model a
-change in threshold-exceedance probability. The displayed absolute values are
-formed by adding the modeled conditional quantile change to the separately
-calculated baseline POT quantile.
+This script now recalculates the warming-impact CSV directly from each
+posterior so the baseline and warming scenarios use the same unconditional POT
+quantile definition. For each city, the empirical threshold-exceedance
+probability zeta_u is held fixed while basin warming changes the fitted GPD
+scale. Overall p97.5 and p99 therefore map to city-specific conditional GPD
+probabilities through the empirical zeta_u. These experiments still do not
+model a change in threshold-exceedance probability.
 
 Consistency decisions
 ---------------------
@@ -47,7 +49,7 @@ Consistency decisions
 * Specific humidity is converted from kg kg-1 to g kg-1 only for plotting and
   baseline display.
 * The four target-variable figures use the same city order, basin assignment,
-  warming experiments, p95/p99 columns, and 94% HDIs.
+  warming experiments, overall p97.5/p99 columns, and 94% HDIs.
 * Posterior diagnostics are created during ``fit_one`` in the model pipeline;
   this script does not refit or re-diagnose models.
 """
@@ -167,7 +169,7 @@ VAR_UNITS = {
     "q_at_wbt_daily_peak": r"g kg$^{-1}$",
 }
 
-Q_LEVELS = [0.95, 0.99]
+OVERALL_Q_LEVELS = [0.975, 0.99]
 
 # These match WARMING_EXPTS in the fitting pipeline.
 WARM_ORDER = ["+0.5C", "+1C", "+1.5C", "+2C"]
@@ -225,6 +227,13 @@ def stack_samples(data_array):
     return data_array.stack(
         sample=("chain", "draw")
     ).values
+
+
+def quantile_label(probability):
+    percentile = 100.0 * probability
+    if float(percentile).is_integer():
+        return f"p{int(percentile)}"
+    return f"p{percentile:g}"
 
 
 def load_idata_any(target_var, basin):
@@ -393,7 +402,7 @@ def aggregate_baseline_one_var(target_var):
             a = a_city.isel(city=i).values
             sigma0 = np.exp(a)
 
-            for q in Q_LEVELS:
+            for q in OVERALL_Q_LEVELS:
                 x0 = gpd_unconditional_quantile(
                     u,
                     sigma0,
@@ -466,6 +475,147 @@ def aggregate_baseline_one_var(target_var):
     )
 
     return baseline_df
+
+
+
+# --------------------------------------------------
+# Warming-impact aggregation using overall POT quantiles
+# --------------------------------------------------
+def aggregate_impacts_one_var(target_var):
+    """
+    Recalculate adjacent-basin warming effects as changes in overall daily
+    p97.5 and p99, holding each city's empirical exceedance probability fixed.
+    """
+    print("=" * 80)
+    print(f"WARMING IMPACT AGGREGATION: {target_var}")
+    print("=" * 80)
+
+    basin_to_cities = defaultdict(list)
+    for city, basin in CITY_TO_BASIN.items():
+        basin_to_cities[basin].append(city)
+
+    all_rows = []
+
+    for basin, target_cities in basin_to_cities.items():
+        mpath = meta_path(target_var, basin)
+        if not os.path.exists(mpath):
+            print(
+                f"⚠️ missing metadata for basin='{basin}', "
+                f"var='{target_var}'"
+            )
+            continue
+
+        try:
+            idata, used_path = load_idata_any(target_var, basin)
+            print(f"✅ loaded {basin}: {used_path}")
+        except Exception as exc:
+            print(
+                f"⚠️ could not load idata for basin='{basin}', "
+                f"var='{target_var}': {exc}"
+            )
+            continue
+
+        meta = pd.read_pickle(mpath)
+        cities = list(meta["cities"])
+        u_by_city = meta["u_by_city"]
+        n_days_by_city = meta["n_days_by_city"]
+        n_exc_by_city = meta["n_exc_by_city"]
+
+        post = idata.posterior
+        required = {"xi", "a_city", "b_city"}
+        missing = required.difference(post.data_vars)
+        if missing:
+            raise KeyError(
+                f"Posterior for {target_var}/{basin} is missing: "
+                f"{sorted(missing)}"
+            )
+
+        xi = stack_samples(post["xi"])
+        a_city = post["a_city"].stack(sample=("chain", "draw"))
+        b_city = post["b_city"].stack(sample=("chain", "draw"))
+        city_to_i = {city: i for i, city in enumerate(cities)}
+
+        for city in cities:
+            if city not in target_cities:
+                continue
+
+            i = city_to_i[city]
+            u = float(u_by_city[city])
+            n_days = int(n_days_by_city[city])
+            n_exc = int(n_exc_by_city[city])
+            zeta_u = n_exc / n_days
+
+            a = a_city.isel(city=i).values
+            b = b_city.isel(city=i).values
+            sigma0 = np.exp(a)
+
+            for warming_label, warming_c in WARMING_EXPTS.items():
+                sigma1 = np.exp(a + b * warming_c)
+
+                for overall_q in OVERALL_Q_LEVELS:
+                    x0 = gpd_unconditional_quantile(
+                        u=u,
+                        sigma=sigma0,
+                        xi=xi,
+                        q=overall_q,
+                        zeta_u=zeta_u,
+                    )
+                    x1 = gpd_unconditional_quantile(
+                        u=u,
+                        sigma=sigma1,
+                        xi=xi,
+                        q=overall_q,
+                        zeta_u=zeta_u,
+                    )
+                    delta = x1 - x0
+                    low, high = az.hdi(delta, hdi_prob=0.94)
+
+                    threshold_quantile = 1.0 - zeta_u
+                    conditional_q = (
+                        (overall_q - threshold_quantile) / zeta_u
+                        if overall_q > threshold_quantile
+                        else 0.0
+                    )
+
+                    all_rows.append(
+                        {
+                            "target_var": target_var,
+                            "city": city,
+                            "basin_warmed": basin,
+                            "warming": warming_label,
+                            "warming_C": warming_c,
+                            "quantile": overall_q,
+                            "overall_quantile": overall_q,
+                            "conditional_gpd_quantile": conditional_q,
+                            "delta_mean": float(np.mean(delta)),
+                            "delta_hdi_low": float(low),
+                            "delta_hdi_high": float(high),
+                            "n_days": n_days,
+                            "n_exc": n_exc,
+                            "zeta_u": zeta_u,
+                            "u": u,
+                        }
+                    )
+
+    impact_df = pd.DataFrame(all_rows)
+    if impact_df.empty:
+        raise RuntimeError(
+            f"No warming-impact rows were produced for {target_var}."
+        )
+
+    impact_df["city"] = pd.Categorical(
+        impact_df["city"],
+        categories=CITY_ORDER,
+        ordered=True,
+    )
+    impact_df = impact_df.sort_values(
+        ["city", "quantile", "warming_C"]
+    ).reset_index(drop=True)
+
+    out_csv = impact_csv_path(target_var)
+    impact_df.to_csv(out_csv, index=False)
+    print(f"✅ wrote corrected overall-quantile impact CSV: {out_csv}")
+    return impact_df
 
 
 # --------------------------------------------------
@@ -589,7 +739,7 @@ def plot_one_var(target_var, impact_df, baseline_df):
     
     fig, axes = plt.subplots(
         nrows=len(cities),
-        ncols=len(Q_LEVELS),
+        ncols=len(OVERALL_Q_LEVELS),
         figsize=(
             7.5,
             ROW_HEIGHT * len(cities),
@@ -613,7 +763,7 @@ def plot_one_var(target_var, impact_df, baseline_df):
     for i, city in enumerate(cities):
         basin = CITY_TO_BASIN[city]
 
-        for j, q in enumerate(Q_LEVELS):
+        for j, q in enumerate(OVERALL_Q_LEVELS):
             ax = axes[i, j]
 
             panel_label = (
@@ -781,14 +931,14 @@ def plot_one_var(target_var, impact_df, baseline_df):
 
             if i == 0:
                 ax.set_title(
-                    f"{int(q * 100)}th percentile",
+                    f"Overall daily {quantile_label(q)}",
                     fontsize=9,
                 )
 
             if i == len(cities) - 1:
                 ax.set_xlabel(
                     (
-                        "Change in extreme $T_w$ "
+                        "Change in overall daily quantile "
                         f"({VAR_UNITS[target_var]})"
                     ),
                     fontsize=8,
@@ -854,6 +1004,9 @@ def main():
 
         try:
             aggregate_baseline_one_var(
+                target_var
+            )
+            aggregate_impacts_one_var(
                 target_var
             )
 
