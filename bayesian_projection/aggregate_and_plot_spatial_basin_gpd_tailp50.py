@@ -509,7 +509,6 @@ def make_maps(
                 shading="auto",
                 cmap="RdBu_r",
                 norm=norm,
-                rasterized = True,
             )
 
             add_map_features(axis, show_labels=index == 0)
@@ -557,7 +556,7 @@ def make_maps(
         )
 
         fig.savefig(PNG_OUT, dpi=250, bbox_inches="tight")
-        fig.savefig(PDF_OUT, dpi=150, bbox_inches="tight")
+        fig.savefig(PDF_OUT, dpi=300, bbox_inches="tight")
 
         if ARGS.show:
             plt.show()

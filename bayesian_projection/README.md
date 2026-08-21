@@ -4,7 +4,7 @@ This repository contains the Bayesian statistical models used to investigate how
 
 The repository accompanies:
 
-> Bose, D., & Tuholske, C. *(in preparation)*
+> Bose, D., Raymond, C., Parks, R. & Tuholske, C. *(in preparation)*
 
 The analysis is organized as a sequence of independent Bayesian models. Each model has a corresponding aggregation and plotting script that reproduces the figures and tables used in the manuscript.
 
@@ -340,8 +340,8 @@ pytensor
 If this repository contributes to your research, please cite the accompanying manuscript once published.
 
 ```
-Bose, D., & Tuholske, C.
-Remote Climate Variability and Local Sea-Surface Temperature Forcing of Humid-Heat Extremes in the Arabian Peninsula.
+Bose, D., Raymond, C., Parks, R., & Tuholske, C.
+El Niño-Southern Oscillation, Indian Ocean Dipole, and Local Sea-Surface Temperature Forcing of Humid-Heat Extremes in the Arabian Peninsula
 ```
 
 ---
